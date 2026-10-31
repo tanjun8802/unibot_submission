@@ -7,5 +7,5 @@ services:
       UNIBOT_SUBMISSION_TOKEN: dev-token
       UNIBOT_CONTROL_SPACE: joint
     volumes:
-      - ./policy:/app/policy
-      - ./example:/app/example
+      - .:/app
+      - ../dataset:/app/dataset:ro
