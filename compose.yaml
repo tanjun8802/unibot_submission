@@ -1,0 +1,11 @@
+services:
+  policy:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      UNIBOT_SUBMISSION_TOKEN: dev-token
+      UNIBOT_CONTROL_SPACE: joint
+    volumes:
+      - ./policy:/app/policy
+      - ./example:/app/example
