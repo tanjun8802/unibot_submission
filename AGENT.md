@@ -1,0 +1,6 @@
+# UniBot-V1 challenge working rules
+
+- **Follow the competition rules.** Use the [organiser’s competition rules](https://scnhkkqlu12w.feishu.cn/docx/Uz7OdFBcDoqP1dxgH62cHW1CnMh) as the source of truth. Review the relevant rules before changing code. Keep the submission compatible with the evaluator interface and the organiser’s real-time testing procedure. A local test pass does not replace real-time validation.
+- **Test before every commit.** Run the existing tests and any checks relevant to the change to catch regressions. For policy or service changes, also run the bundled server and client together and confirm that all validation steps pass. Fix failures before committing, and report any checks that could not be run.
+- **Commit every completed change.** After validation, commit the changes with a clear message describing what changed and, where useful, why. Keep unrelated changes out of the commit.
+- **Work inside the existing Docker container.** Use the Compose `policy` service for development, running code, and testing. From the host, use Docker Compose to start the service and enter it (`docker compose exec policy sh`), or attach VS Code to it and open `/app`. Do not run project code, install project dependencies, or run tests directly on the host.
