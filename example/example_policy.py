@@ -1,91 +1,150 @@
-"""Reference policy: emits zero actions in the declared control space.
-Replace the body of get_action with your model. Served by run_server.py.
+"""HangCup joint-space behavior cloning from LeRobot demonstrations.
 
-    UNIBOT_SUBMISSION_TOKEN=<token> UNIBOT_CONTROL_SPACE=joint|ee
+Train inside the policy container with PyArrow installed:
+    python example/example_policy.py DATASET CHECKPOINT.npz
+Set UNIBOT_HANGCUP_CHECKPOINT to the resulting file before starting the server.
+PyArrow is only needed for training.
 """
 
+import argparse
 import os
+from pathlib import Path
 
 import numpy as np
 
-CONTROL_SPACES = ("joint", "ee")
+OFFSETS = (-8, -4, 0)
+CHUNK_SIZE = 4
+CHANNELS = {"left_arm": 7, "right_arm": 7, "left_gripper": 1, "right_gripper": 1}
+STATE_KEYS = tuple(f"observation.state.{name}" for name in CHANNELS)
+ACTION_KEYS = tuple(f"action.{name}" for name in CHANNELS) + ("action.pivot",)
+STATE_DIM = sum(CHANNELS.values())
+
+
+def features(history, mean, scale, projection, bias):
+    normalized = np.clip((history - mean) / scale, -8, 8)
+    return np.concatenate(
+        (normalized, np.cos(normalized @ projection + bias),
+         np.ones((len(history), 1), dtype=np.float32)),
+        axis=1,
+    )
 
 
 class ExamplePolicy:
-    """Stub policy; token and control_space are read from env vars."""
-
-    ACTION_CHUNK_SIZE = 8
-    # Per-key temporal stacking: obs_delta_indices[key][i] is frame i's offset
-    # from the current step, so a key's observation carries len(value) stacked
-    # frames. Its keys also select which observations are sent — declare only
-    # the observations the model consumes. Offsets are <= 0 and strictly
-    # increasing, so index 0 is the oldest frame and the last index is the
-    # newest; e.g. [-4, -2, 0] stacks the frames at t-4, t-2 and the current
-    # step t, and [0] is a single current frame. Non-contiguous spacing such as
-    # [-10, -5, -2, 0] is allowed. `observation.language` is a scalar string
-    # with no time axis, so its offset must be exactly [0].
-    OBS_DELTA_INDICES = {
-        "observation.language":                         [0],
-        "observation.images.cam_left_high":             [-10, -5, -2, 0],
-        "observation.images.cam_left_wrist":            [-10, -5, -2, 0],
-        "observation.images.cam_right_wrist":           [-10, -5, -2, 0],
-        "observation.state.left_arm":                   [-4, -2, 0],
-        "observation.state.right_arm":                  [-4, -2, 0],
-        "observation.state.left_ee_pose_gripper_base":  [-4, -2, 0],
-        "observation.state.right_ee_pose_gripper_base": [-4, -2, 0],
-        "observation.state.left_gripper":               [-4, -2, 0],
-        "observation.state.right_gripper":              [-4, -2, 0],
-        "observation.state.lower_body":                 [-4, -2, 0],
-    }
-    # Ask the client to resize these image keys to [height, width] before
-    # sending them; each key must also appear in OBS_DELTA_INDICES. Image keys
-    # left out of this map are delivered at their native catalog resolution.
-    IMAGE_RESIZE = {
-        "observation.images.cam_left_high":  [240, 320],
-        "observation.images.cam_left_wrist": [128, 128],
-    }
+    """Predict a short chunk of joint targets from measured motion history."""
 
     def __init__(self):
-        """Read token and control_space from the environment; both required."""
-        self._token = os.environ.get("UNIBOT_SUBMISSION_TOKEN")
-        self._control_space = os.environ.get("UNIBOT_CONTROL_SPACE")
-        self._step = 0
-        if self._token is None:
-            raise ValueError("UNIBOT_SUBMISSION_TOKEN is required")
-        if self._control_space not in CONTROL_SPACES:
-            raise ValueError(f"unknown control_space {self._control_space!r}; expected one of {CONTROL_SPACES}")
+        self._token = os.environ["UNIBOT_SUBMISSION_TOKEN"]
+        if os.environ.get("UNIBOT_CONTROL_SPACE") != "joint":
+            raise ValueError("HangCup requires UNIBOT_CONTROL_SPACE=joint")
+        with np.load(os.environ["UNIBOT_HANGCUP_CHECKPOINT"], allow_pickle=False) as model:
+            self._model = {name: model[name] for name in model.files}
 
     @property
     def metadata(self):
-        """Contract sent to the evaluator at handshake."""
         return {
-            "control_space":     self._control_space,
-            "obs_delta_indices": {k: list(v) for k, v in self.OBS_DELTA_INDICES.items()},
-            "image_resize":      {k: list(v) for k, v in self.IMAGE_RESIZE.items()},
-            "action_chunk_size": self.ACTION_CHUNK_SIZE,
-            "token":             self._token,
+            "control_space": "joint",
+            "obs_delta_indices": {key: list(OFFSETS) for key in STATE_KEYS},
+            "image_resize": {},
+            "action_chunk_size": CHUNK_SIZE,
+            "token": self._token,
         }
 
     def get_action(self, obs):
-        """Return one zero action chunk for the active control space."""
-        self._step += 1
-        T = self.ACTION_CHUNK_SIZE
+        history = np.concatenate([obs[key] for key in STATE_KEYS], axis=-1)
+        history = np.asarray(history, dtype=np.float32).reshape(1, -1)
+        model = self._model
+        design = features(history, model["mean"], model["scale"],
+                          model["projection"], model["bias"])
+        targets = (design @ model["weights"]).reshape(CHUNK_SIZE, -1)
+        targets[:, :STATE_DIM] += history[0, -STATE_DIM:]
+        targets = np.clip(targets, model["low"], model["high"])
 
-        action = {
-            "meta.token":           self._token,
-            "action.left_gripper":  np.zeros((T, 1), dtype=np.float32),
-            "action.right_gripper": np.zeros((T, 1), dtype=np.float32),
-            "action.pivot":         np.zeros((T, 7), dtype=np.float32),
-        }
-        if self._control_space == "joint":
-            action["action.left_arm"]  = np.zeros((T, 7), dtype=np.float32)
-            action["action.right_arm"] = np.zeros((T, 7), dtype=np.float32)
-        else:
-            action["action.left_ee_pose_gripper_base"]  = np.zeros((T, 6), dtype=np.float32)
-            action["action.right_ee_pose_gripper_base"] = np.zeros((T, 6), dtype=np.float32)
+        action = {"meta.token": self._token}
+        start = 0
+        for key, width in zip(ACTION_KEYS, (*CHANNELS.values(), 7)):
+            action[key] = np.ascontiguousarray(targets[:, start:start + width])
+            start += width
         return action
 
     def reset(self):
-        """Clear per-episode state."""
-        self._step = 0
         return {"ok": True}
+
+
+def train(dataset, checkpoint):
+    import pyarrow.parquet as parquet
+
+    paths = sorted(dataset.glob("data/*/*.parquet"))
+    if not paths:
+        raise ValueError(f"No demonstration Parquet files in {dataset}")
+    rng = np.random.default_rng(42)
+    train_history, train_targets = [], []
+    val_history, val_targets = [], []
+
+    for path in paths:
+        table = parquet.read_table(
+            path, columns=[*STATE_KEYS, *ACTION_KEYS, "episode_index", "frame_index"]
+        )
+        episode_ids = table["episode_index"].to_numpy()
+        frames = table["frame_index"].to_numpy()
+        state, action = (
+            np.concatenate(
+                [np.asarray(table[key].to_pylist(), dtype=np.float32).reshape(len(table), -1)
+                 for key in keys],
+                axis=1,
+            )
+            for keys in (STATE_KEYS, ACTION_KEYS)
+        )
+        for episode in np.unique(episode_ids):
+            rows = np.flatnonzero(episode_ids == episode)
+            rows = rows[np.argsort(frames[rows])]
+            if not np.array_equal(frames[rows], np.arange(len(rows))):
+                raise ValueError(f"Episode {episode} has missing or repeated frames")
+            step = np.arange(len(rows))
+            history = state[rows[np.maximum(step[:, None] + OFFSETS, 0)]]
+            targets = action[rows[np.minimum(step[:, None] + np.arange(CHUNK_SIZE),
+                                             len(rows) - 1)]].copy()
+            targets[:, :, :STATE_DIM] -= history[:, -1:, :]
+            histories, actions = (
+                (val_history, val_targets) if episode % 10 == 0
+                else (train_history, train_targets)
+            )
+            histories.append(history.reshape(len(rows), -1))
+            actions.append(targets)
+
+    x, y = np.concatenate(train_history), np.concatenate(train_targets)
+    val_x, val_y = np.concatenate(val_history), np.concatenate(val_targets)
+    if not all(np.isfinite(array).all() for array in (x, y, val_x, val_y)):
+        raise ValueError("Demonstrations contain non-finite observations or actions")
+    mean, scale = x.mean(axis=0), np.maximum(x.std(axis=0), 0.02)
+    projection = rng.normal(0, 0.25 / np.sqrt(x.shape[1]), (x.shape[1], 512)).astype(np.float32)
+    bias = rng.uniform(0, 2 * np.pi, 512).astype(np.float32)
+    width = x.shape[1] + len(bias) + 1
+    gram = np.eye(width, dtype=np.float64) * 0.1
+    cross = np.zeros((width, CHUNK_SIZE * y.shape[-1]), dtype=np.float64)
+    for start in range(0, len(x), 4096):
+        batch = slice(start, start + 4096)
+        design = features(x[batch], mean, scale, projection, bias).astype(np.float64)
+        gram += design.T @ design
+        cross += design.T @ y[batch].reshape(len(design), -1)
+    weights = np.linalg.solve(gram, cross).astype(np.float32)
+    absolute = y.copy()
+    absolute[:, :, :STATE_DIM] += x[:, None, -STATE_DIM:]
+    low, high = absolute.min(axis=(0, 1)), absolute.max(axis=(0, 1))
+    predicted = (features(val_x, mean, scale, projection, bias) @ weights).reshape(val_y.shape)
+    reference = np.zeros_like(val_y)
+    reference[:, :, STATE_DIM:] = y[:, :, STATE_DIM:].mean(axis=(0, 1))
+    for label, channel in (("arms", slice(0, 14)), ("right gripper", slice(15, 16))):
+        mae = np.abs(predicted[:, :, channel] - val_y[:, :, channel]).mean()
+        baseline = np.abs(reference[:, :, channel] - val_y[:, :, channel]).mean()
+        print(f"Held-out {label} MAE: {mae:.4f} (hold baseline {baseline:.4f})")
+    print(f"Episodes: {len(train_history)} train, {len(val_history)} validation")
+    np.savez_compressed(checkpoint, mean=mean, scale=scale, projection=projection,
+                        bias=bias, weights=weights, low=low, high=high)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset", type=Path)
+    parser.add_argument("checkpoint", type=Path)
+    args = parser.parse_args()
+    train(args.dataset, args.checkpoint)
